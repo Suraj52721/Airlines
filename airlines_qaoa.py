@@ -567,7 +567,7 @@ class Airlines:
         counts = {}
         for sample, energy, num_occurrences in sampleset.data(['sample', 'energy', 'num_occurrences']):
             # Convert sample dict to bitstring
-            bitstring = ''.join(str(sample[i]) for i in range(self.n_routes))
+            bitstring = ''.join(str(sample[i]) for i in range(self.n_routes))[::-1]
             if bitstring in counts:
                 counts[bitstring] += num_occurrences
             else:
