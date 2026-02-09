@@ -529,7 +529,7 @@ class Airlines:
         best_energy = sampleset.first.energy
         
         # Convert sample dict to bitstring for consistency with QAOA results
-        bitstring = ''.join(str(best_sample[i]) for i in range(self.n_routes))
+        bitstring = ''.join(str(best_sample[i]) for i in range(self.n_routes))[::-1]
         
         print(f"\nSimulated Annealing Result:")
         print(f"Best Bitstring: {bitstring}")
