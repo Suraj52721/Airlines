@@ -257,138 +257,106 @@ class Airlines:
         
         return expectation
     
-    def verify_solution(self, bitstring):
-        """
-        Verify if a bitstring satisfies all constraints.
-        
-        Parameters:
-        -----------
-        bitstring : str
-            Binary string representing route selection
-            
-        Returns:
-        --------
-        valid : bool
-            True if all constraints are satisfied
-        details : dict
-            Detailed constraint satisfaction information
-        """
-        x = np.array([int(bit) for bit in bitstring[::-1]])
-        
-        # Check flight coverage constraints
-        flight_coverage = self.afr @ x
-        flights_ok = np.all(flight_coverage == 1)
-        
-        # Check tail assignment constraints
-        tail_assignment = self.btr @ x
-        tails_ok = np.all(tail_assignment == 1)
-        
-        details = {
-            'valid': flights_ok and tails_ok,
-            'flights_covered': flight_coverage.tolist(),
-            'flights_satisfied': flights_ok,
-            'tails_assigned': tail_assignment.tolist(),
-            'tails_satisfied': tails_ok,
-            'selected_routes': [i for i, bit in enumerate(x) if bit == 1],
-            'energy': self.compute_energy(bitstring)
-        }
-        
-        return details['valid'], details
     
-    def optimize(self, p_layers=1, initial_params=None, shots=1024, method='COBYLA'):
-        """
-        Run the complete QAOA optimization.
-        
-        Parameters:
-        -----------
-        p_layers : int
-            Number of QAOA layers
-        initial_params : list, optional
-            Initial parameter values [γ_0, β_0, γ_1, β_1, ...] for p layers
-            If None, uses [1.0, 1.0, ...] for all parameters
-        shots : int
-            Number of measurement shots
-        method : str
-            Classical optimization method
-            
-        Returns:
-        --------
-        result : dict
-            Optimization results including optimal parameters and final counts
-        """
-        # Build circuit if not already built or if different p_layers
+    def optimize(self, p_layers=1, initial_params=None, shots=4096,
+             method="COBYLA", seed=123, n_starts=10,
+             init_strategy="random", final_shots=5000,
+             wrap_angles=True):
+
+        # Build circuit
         if self.circuit is None or self.p_layers != p_layers:
             self.build_qaoa(p_layers)
-        
-        # Initialize simulator
-        simulator = AerSimulator()
-        
-        # Objective function for classical optimizer
+
+        rng = np.random.default_rng(seed)
+
+        # Aer: seed_transpiler may not exist in your Aer version
+        simulator = AerSimulator(seed_simulator=int(seed))
+
+        def _wrap(params):
+            if not wrap_angles:
+                return params
+            # wrap all angles into [0, 2π)
+            return np.mod(params, 2*np.pi)
+
         def objective_function(params):
-            # params = [γ_0, β_0, γ_1, β_1, ..., γ_{p-1}, β_{p-1}]
-            # Create parameter binding dictionary
+            params = _wrap(np.asarray(params, dtype=float))
+
             param_dict = {}
             for k in range(p_layers):
-                param_dict[self.gamma_params[k]] = params[2*k]
-                param_dict[self.beta_params[k]] = params[2*k + 1]
-            
-            # Bind parameters
+                param_dict[self.gamma_params[k]] = float(params[2*k])
+                param_dict[self.beta_params[k]]  = float(params[2*k + 1])
+
             bound_circuit = self.circuit.assign_parameters(param_dict)
-            
-            # Run simulation
-            result = simulator.run(bound_circuit, shots=shots).result()
+            result = simulator.run(bound_circuit, shots=int(shots)).result()
             counts = result.get_counts()
-            
             return self.compute_expectation(counts)
-        
-        # Initial parameters: [γ_0, β_0, γ_1, β_1, ..., γ_{p-1}, β_{p-1}]
-        if initial_params is None:
-            initial_params = [1.0, 1.0] * p_layers
-        
-        assert len(initial_params) == 2 * p_layers, \
-            f"Expected {2*p_layers} parameters for {p_layers} layers, got {len(initial_params)}"
-        
-        # Optimize
-        print(f"Starting QAOA optimization with {p_layers} layer(s)...")
-        print(f"Optimizing {2*p_layers} parameters: ", end="")
+
+        # --- build initial points ---
+        def sample_init():
+            if init_strategy == "ones":
+                return np.array([1.0, 1.0] * p_layers, dtype=float)
+
+            # Random: γ in [0, π], β in [0, π/2]
+            x = np.zeros(2*p_layers, dtype=float)
+            for k in range(p_layers):
+                x[2*k]   = rng.uniform(0.0, np.pi)
+                x[2*k+1] = rng.uniform(0.0, 0.5*np.pi)
+            return x
+
+        inits = []
+        if initial_params is not None:
+            x0 = np.array(initial_params, dtype=float)
+            assert len(x0) == 2*p_layers
+            inits = [x0]
+        else:
+            # multi-start
+            inits = [sample_init() for _ in range(int(n_starts))]
+            print(inits)
+            print(len(inits))
+
+        # --- multi-start optimization ---
+        best_res = None
+        print(f"Starting QAOA optimization: p={p_layers}, method={method}, starts={len(inits)}")
+
+        for s, x0 in enumerate(inits, 1):
+            print(f"  Start {s}/{len(inits)} ...", end="")
+            print(x0)
+
+            res = minimize(objective_function, x0, method=method)
+            print(res)
+            print(f" done | E={res.fun:.6f}")
+            if (best_res is None) or (res.fun < best_res.fun):
+                best_res = res
+
+        res = best_res
+        x_opt = _wrap(res.x)
+
+        print("\nOptimization complete!")
         for k in range(p_layers):
-            print(f"(γ_{k}, β_{k})", end=" ")
-        print()
-        
-        res = minimize(objective_function, initial_params, method=method)
-        
-        print(f"\nOptimization complete!")
-        print(f"Optimal parameters:")
-        for k in range(p_layers):
-            print(f"  Layer {k}: γ_{k} = {res.x[2*k]:.4f}, β_{k} = {res.x[2*k+1]:.4f}")
-        print(f"Final expectation: {res.fun:.4f}")
-        
-        # Run final circuit with optimal parameters
-        param_dict = {}
-        for k in range(p_layers):
-            param_dict[self.gamma_params[k]] = res.x[2*k]
-            param_dict[self.beta_params[k]] = res.x[2*k + 1]
-        
+            print(f"  Layer {k}: γ_{k} = {x_opt[2*k]:.4f}, β_{k} = {x_opt[2*k+1]:.4f}")
+        print(f"Final expectation: {res.fun:.6f}")
+
+        # Final sampling
+        param_dict = {self.gamma_params[k]: float(x_opt[2*k]) for k in range(p_layers)}
+        param_dict.update({self.beta_params[k]: float(x_opt[2*k+1]) for k in range(p_layers)})
+
         final_circuit = self.circuit.assign_parameters(param_dict)
-        
-        final_result = simulator.run(final_circuit, shots=5000).result()
-        final_counts = final_result.get_counts()
-        
-        # Store optimal parameters in more readable format
-        optimal_gammas = [res.x[2*k] for k in range(p_layers)]
-        optimal_betas = [res.x[2*k+1] for k in range(p_layers)]
-        
+        final_counts = simulator.run(final_circuit, shots=int(final_shots)).result().get_counts()
+
+        optimal_gammas = [float(x_opt[2*k]) for k in range(p_layers)]
+        optimal_betas  = [float(x_opt[2*k+1]) for k in range(p_layers)]
+
         return {
-            'optimal_gammas': optimal_gammas,
-            'optimal_betas': optimal_betas,
-            'optimal_params': res.x,
-            'expectation_value': res.fun,
-            'counts': final_counts,
-            'optimization_result': res,
-            'p_layers': p_layers
+            "optimal_gammas": optimal_gammas,
+            "optimal_betas": optimal_betas,
+            "optimal_params": x_opt,
+            "expectation_value": float(res.fun),
+            "counts": final_counts,
+            "optimization_result": res,
+            "p_layers": p_layers,
         }
     
-    def analyze_results(self, counts, top_k=5, valid_sol=True):
+    def analyze_results(self, counts, top_k=5):
         """
         Analyze and display the top solutions.
         
@@ -398,9 +366,7 @@ class Airlines:
             Measurement counts
         top_k : int
             Number of top solutions to display
-        valid_sol : bool
-            Prints valid solutions if True, otherwise prints all solutions with their validity status
-            
+           
         Returns:
         --------
         solutions : list
@@ -409,38 +375,25 @@ class Airlines:
         sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
         
         solutions = []
-        if valid_sol:
-            print(f"\n{'='*80}")
-            print(f"Valid Solution Found:")
-            print(f"{'='*80}")
-            for i, (bitstring, count) in enumerate(sorted_counts):
-                valid, details = self.verify_solution(bitstring)
-                if valid:
-                    print(f"\n{i+1}. Bitstring: {bitstring}  Counts: {count}  Energy: {details['energy']:.4f}")
-            
+        
         print(f"\n{'='*80}")
         print(f"Top {top_k} Solutions:")
         print(f"{'='*80}")
         
         for i, (bitstring, count) in enumerate(sorted_counts[:top_k]):
-            valid, details = self.verify_solution(bitstring)
+            x = np.array([int(bit) for bit in bitstring[::-1]])
+            details = [i for i, bit in enumerate(x) if bit == 1]
             energy = self.compute_energy(bitstring)
             
             print(f"\n{i+1}. Bitstring: {bitstring}")
             print(f"   Counts: {count}")
             print(f"   Energy: {energy:.4f}")
-            print(f"   Valid: {'✓' if valid else '✗'}")
-            print(f"   Selected Routes: {details['selected_routes']}")
-            
-            if not valid:
-                print(f"   Flight Coverage: {details['flights_covered']} (should be all 1s)")
-                print(f"   Tail Assignment: {details['tails_assigned']} (should be all 1s)")
-            
+            print(f"   Selected Routes: {details}")
+           
             solutions.append({
                 'bitstring': bitstring,
                 'count': count,
                 'energy': energy,
-                'valid': valid,
                 'details': details
             })
         
@@ -534,16 +487,12 @@ class Airlines:
         print(f"\nSimulated Annealing Result:")
         print(f"Best Bitstring: {bitstring}")
         print(f"Best Energy: {best_energy:.4f}")
-        
-        # Verify the solution
-        valid, details = self.verify_solution(bitstring)
-        print(f"Valid Solution: {'✓' if valid else '✗'}")
-        
+        x = np.array([int(bit) for bit in bitstring[::-1]])
+        details = [i for i, bit in enumerate(x) if bit == 1]
         return {
             'best_sample': best_sample,
             'best_bitstring': bitstring,
             'best_energy': best_energy,
-            'valid': valid,
             'details': details,
             'sampleset': sampleset
         }
@@ -580,15 +529,10 @@ class Airlines:
         bitstrings = [item[0] for item in sorted_counts]
         frequencies = [item[1] for item in sorted_counts]
         
-        # Create color coding based on validity
-        colors = []
-        for bitstring in bitstrings:
-            valid, _ = self.verify_solution(bitstring)
-            colors.append('green' if valid else 'red')
         
         # Create the plot
         fig, ax = plt.subplots(figsize=figsize)
-        bars = ax.bar(range(len(bitstrings)), frequencies, color=colors, alpha=0.7, edgecolor='black')
+        bars = ax.bar(range(len(bitstrings)), frequencies, color = 'black', alpha = 0.7, edgecolor='black')
         
         # Customize the plot
         ax.set_xlabel('Solution (Bitstring)', fontsize=12, fontweight='bold')
@@ -605,13 +549,6 @@ class Airlines:
                     f'{freq}',
                     ha='center', va='bottom', fontsize=9, fontweight='bold')
         
-        # Add legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='green', alpha=0.7, edgecolor='black', label='Valid Solution'),
-            Patch(facecolor='red', alpha=0.7, edgecolor='black', label='Invalid Solution')
-        ]
-        ax.legend(handles=legend_elements, loc='upper right')
         
         plt.tight_layout()
         plt.show()
@@ -621,10 +558,7 @@ class Airlines:
         print(f"Simulated Annealing Histogram Summary")
         print(f"{'='*80}")
         print(f"Total unique solutions found: {len(counts)}")
-        print(f"Displaying top {len(bitstrings)} solutions")
         
-        valid_count = sum(1 for bs in bitstrings if self.verify_solution(bs)[0])
-        print(f"Valid solutions in top {top_k}: {valid_count}/{len(bitstrings)}")
         
         return fig, ax
 
@@ -650,17 +584,14 @@ class Airlines:
         bitstrings = [item[0] for item in sorted_counts]
         frequencies = [item[1] for item in sorted_counts]
         
-        # Create color coding based on validity
-        colors = []
+       
         energies = []
         for bitstring in bitstrings:
-            valid, _ = self.verify_solution(bitstring)
-            colors.append('green' if valid else 'red')
             energies.append(self.compute_energy(bitstring))
         
         # Create the plot
         fig, ax = plt.subplots(figsize=figsize)
-        bars = ax.bar(range(len(bitstrings)), frequencies, color=colors, alpha=0.7, edgecolor='black')
+        bars = ax.bar(range(len(bitstrings)), frequencies,color='black' , alpha=0.7, edgecolor='black')
         
         # Customize the plot
         ax.set_xlabel('Solution (Bitstring)', fontsize=12, fontweight='bold')
@@ -678,13 +609,6 @@ class Airlines:
                     f'{freq}',
                     ha='center', va='bottom', fontsize=9, fontweight='bold')
         
-        # Add legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='green', alpha=0.7, edgecolor='black', label='Valid Solution'),
-            Patch(facecolor='red', alpha=0.7, edgecolor='black', label='Invalid Solution')
-        ]
-        ax.legend(handles=legend_elements, loc='upper right')
         
         plt.tight_layout()
         plt.show()
@@ -694,21 +618,6 @@ class Airlines:
         print(f"QAOA Histogram Summary")
         print(f"{'='*80}")
         print(f"Total unique solutions found: {len(counts)}")
-        print(f"Displaying top {len(bitstrings)} solutions")
         print(f"QAOA layers (p): {qaoa_result['p_layers']}")
-        
-        valid_count = sum(1 for bs in bitstrings if self.verify_solution(bs)[0])
-        print(f"Valid solutions in top {top_k}: {valid_count}/{len(bitstrings)}")
-        
-        # Show best valid solution
-        for i, bs in enumerate(bitstrings):
-            valid, details = self.verify_solution(bs)
-            if valid:
-                print(f"\nBest valid solution:")
-                print(f"  Bitstring: {bs}")
-                print(f"  Frequency: {frequencies[i]}")
-                print(f"  Energy: {energies[i]:.4f}")
-                print(f"  Selected routes: {details['selected_routes']}")
-                break
         
         return fig, ax
